@@ -1,0 +1,124 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "./LendingMath.sol"; // Our math helper functions
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol"; // Safety net
+
+// Simple DeFi lending pool using ETH
+contract DeFiLending is ReentrancyGuard {
+    using LendingMath for uint256; // Enable our library's functions on uint256
+
+    // Track what users have deposited, borrowed, and locked up as collateral
+    mapping(address => uint256) public lenderBalances;
+    mapping(address => uint256) public loans;
+    mapping(address => uint256) public collateral;
+
+    // Rules of the game
+    uint256 public constant COLLATERAL_RATIO = 150; // 150% required to borrow
+    uint256 public constant LIQUIDATION_THRESHOLD = 120; // Below 120% = liquidation
+    uint256 public constant INTEREST_RATE = 5; // Flat 5% interest
+
+    // Total ETH in the lending pool
+    uint256 public totalLiquidity;
+
+    // Let the frontend know what's happening
+    event Deposited(address indexed user, uint256 amount);
+    event Borrowed(address indexed user, uint256 amount, uint256 collateral);
+    event Repaid(address indexed user, uint256 amount);
+    event Liquidated(address indexed user, uint256 collateralSeized);
+
+    // Handle direct ETH transfers gracefully
+    receive() external payable {
+        deposit();
+    }
+
+    fallback() external payable {
+        revert("Use the deposit function, pal.");
+    }
+
+    // Deposit ETH into the lending pool
+    function deposit() public payable nonReentrant {
+        require(msg.value > 0, "Dude, send some ETH at least");
+        lenderBalances[msg.sender] += msg.value;
+        totalLiquidity += msg.value;
+        emit Deposited(msg.sender, msg.value);
+    }
+
+    // Borrow ETH by locking up collateral
+    function borrow(uint256 amount) external payable nonReentrant {
+        require(amount <= totalLiquidity, "Sorry, pool’s dry");
+        require(loans[msg.sender] == 0, "Pay your old loan first, man");
+
+        // Calculate how much collateral you need
+        uint256 requiredCollateral = amount.calculateCollateral(COLLATERAL_RATIO);
+        require(msg.value >= requiredCollateral, "Not enough collateral, bro");
+
+        // Record the debt and collateral
+        loans[msg.sender] = amount;
+        collateral[msg.sender] = msg.value;
+        totalLiquidity -= amount;
+
+        // Send the borrowed ETH
+        (bool sent, ) = msg.sender.call{value: amount}("");
+        require(sent, "ETH send failed, ugh");
+
+        emit Borrowed(msg.sender, amount, msg.value);
+    }
+
+    // Repay your loan (with interest) and get your collateral back
+    function repay() external payable nonReentrant {
+        uint256 loanAmount = loans[msg.sender];
+        require(loanAmount > 0, "You don’t owe anything, chill");
+
+        // Calculate interest and total to repay
+        uint256 interest = loanAmount.calculateInterest(INTEREST_RATE);
+        uint256 totalRepayment = loanAmount + interest;
+        require(msg.value >= totalRepayment, "Not enough to cover it");
+
+        // Reset loan and return collateral
+        loans[msg.sender] = 0;
+        totalLiquidity += loanAmount;
+
+        uint256 userCollateral = collateral[msg.sender];
+        collateral[msg.sender] = 0;
+
+        (bool sent, ) = msg.sender.call{value: userCollateral}("");
+        require(sent, "Couldn’t send your collateral back, crap");
+
+        emit Repaid(msg.sender, totalRepayment);
+    }
+
+    // Liquidate someone if their collateral is too low
+    function liquidate(address borrower) external nonReentrant {
+        uint256 loanAmount = loans[borrower];
+        uint256 userCollateral = collateral[borrower];
+        require(loanAmount > 0, "Nothing to liquidate here");
+
+        // This is where a real oracle would check actual ETH prices
+        uint256 currentCollateralValue = userCollateral;
+        require(
+            currentCollateralValue.isUnderCollateralized(loanAmount, LIQUIDATION_THRESHOLD),
+            "They’re still good, no liquidation yet"
+        );
+
+        // Pool absorbs the loss, user loses collateral
+        loans[borrower] = 0;
+        collateral[borrower] = 0;
+        totalLiquidity += loanAmount;
+
+        emit Liquidated(borrower, userCollateral);
+    }
+
+    // Withdraw your unused deposited ETH
+    function withdraw(uint256 amount) external nonReentrant {
+        require(lenderBalances[msg.sender] >= amount, "You didn’t lend that much");
+        require(totalLiquidity >= amount, "Pool’s too low right now");
+
+        lenderBalances[msg.sender] -= amount;
+        totalLiquidity -= amount;
+
+        (bool sent, ) = msg.sender.call{value: amount}("");
+        require(sent, "ETH send bombed out");
+    }
+}
+
